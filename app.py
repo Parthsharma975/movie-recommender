@@ -1,60 +1,57 @@
-from flask import Flask, request, render_template
+import os
 import pickle
+
 import pandas as pd
 import requests
+from flask import Flask, request, render_template
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# --- 1. TMDB API Key and Helper Function ---
-TMDB_API_KEY = '4a8a9ef55022158be86fe6ff86e238b3'
+# --- 1. TMDB API key (set as an environment variable, never hard-code it) ---
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+
 
 def fetch_poster(movie_id):
-    """Fetches the poster URL for a given TMDB movie ID."""
-    response = requests.get(f'https://api.themoviedb.org/3/movie/{movie_id}?api_key={TMDB_API_KEY}')
-    response.raise_for_status() 
-    data = response.json()
-    
-    poster_path = data.get('poster_path')
-    
-    if poster_path:
-        return "https://image.tmdb.org/t/p/w500" + poster_path
-    return "" 
-
-# --- 2. Data Loading (Executed Once on Startup) ---
-try:
-    # Load your movie data and similarity matrix
-    movies_dict = pickle.load(open('movies_dict.pkl', 'rb'))
-    movies = pd.DataFrame(movies_dict)
-    similarity = pickle.load(open('similarity.pkl', 'rb'))
-except FileNotFoundError:
-    print("FATAL ERROR: Required pickle files (movies_dict.pkl or similarity.pkl) not found. Check your directory.")
-    exit()
-except Exception as e:
-    print(f"FATAL ERROR during data loading: {e}")
-    exit()
-
-# --- 3. Recommendation Logic Function ---
-def recommend(movie_title):
-    """Finds the top 5 similar movies and fetches their names and posters."""
+    """Fetch poster URL for a TMDB movie id. Returns '' if anything fails."""
     try:
-        movie_index = movies[movies['title'] == movie_title].index[0]
-    except IndexError:
-        # Return default structure if movie is not found
-        return [("Movie not found.", "")] * 5 
+        response = requests.get(
+            f"https://api.themoviedb.org/3/movie/{movie_id}",
+            params={"api_key": TMDB_API_KEY},
+            timeout=5,
+        )
+        response.raise_for_status()
+        poster_path = response.json().get("poster_path")
+        if poster_path:
+            return "https://image.tmdb.org/t/p/w500" + poster_path
+    except requests.RequestException:
+        pass
+    return ""
 
-    distances = similarity[movie_index]
 
-    # Sort the scores and get top 5 indices
-    movies_list = sorted(list(enumerate(distances)), reverse=True, key=lambda x: x[1])[1:6]
+# --- 2. Load data once at startup ---
+# similarity.pkl (185 MB) is no longer needed: vectors are rebuilt from the
+# 'tags' column in a second, and similarity is computed per query.
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+movies = pd.DataFrame(pickle.load(open(os.path.join(BASE_DIR, "movies_dict.pkl"), "rb")))
+vectors = CountVectorizer(max_features=5000, stop_words="english").fit_transform(movies["tags"])
 
-    recommendations = []
 
-    for i in movies_list:
-        # Get the TMDB 'movie_id' from the DataFrame using the internal index
-        movie_id = movies.iloc[i[0]]['movie_id'] 
-        
-        # Append tuple (name, poster_url)
-        recommendations.append((movies.iloc[i[0]].title, fetch_poster(movie_id)))
+# --- 3. Recommendation logic ---
+def recommend(movie_title):
+    """Return top 5 similar movies as [(title, poster_url), ...]."""
+    matches = movies[movies["title"] == movie_title].index
+    if len(matches) == 0:
+        return [("Movie not found.", "")] * 5
 
-    return recommendations
+    idx = matches[0]
+    distances = cosine_similarity(vectors[idx], vectors).flatten()
+    top = sorted(enumerate(distances), reverse=True, key=lambda x: x[1])[1:6]
+
+    return [
+        (movies.iloc[i].title, fetch_poster(movies.iloc[i].movie_id))
+        for i, _ in top
+    ]
+
 
 # --- 4. Flask Application Setup ---
 app = Flask(__name__)
@@ -85,4 +82,4 @@ def home():
     )
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=os.environ.get('FLASK_DEBUG') == '1')
